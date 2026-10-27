@@ -1,0 +1,6 @@
+{
+  "name": "AeroTrack ESP Telemetry Dashboard",
+  "description": "Real-time telemetry ground station for ESP-NOW and ESP32/ESP8266 avionics with 3D Three.js attitude tracking, PlotlyJS graphical analytics, and WebSocket/Serial streaming.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

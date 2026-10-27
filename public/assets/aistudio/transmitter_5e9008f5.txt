@@ -1,0 +1,420 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <Wire.h>
+#include <math.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include <Adafruit_BMP280.h>
+#include <DHT.h>
+
+#define WIFI_CHANNEL 1
+
+#define MPU_ADDR 0x68
+#define ACCEL_SCALE 16384.0
+#define GYRO_SCALE 131.0
+
+// MPU6500: SDA = GPIO21, SCL = GPIO22
+#define MPU_SDA 21
+#define MPU_SCL 22
+
+// BMP280: SDA = GPIO25, SCL = GPIO26
+#define BMP_SDA 25
+#define BMP_SCL 26
+
+// DHT11: DATA = GPIO4
+#define DHTPIN 4
+#define DHTTYPE DHT11
+
+// GPS TX -> ESP32 GPIO16 (RX)
+#define GPS_RX_PIN 16
+
+DHT dht(DHTPIN, DHTTYPE);
+
+// GPS
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+
+// Separate I2C buses
+TwoWire I2C_MPU = TwoWire(0);
+TwoWire I2C_BMP = TwoWire(1);
+
+// BMP280
+Adafruit_BMP280 bmp(&I2C_BMP);
+bool bmpReady = false;
+
+uint8_t receiverMAC[] = {
+  0x24, 0xD7, 0xEB, 0xCD, 0x36, 0xE4
+};
+
+struct SensorPacket {
+  uint32_t packetNo;
+  float temperature;
+  float humidity;
+
+  float ax;
+  float ay;
+  float az;
+  float totalAcc;
+
+  float gx;
+  float gy;
+  float gz;
+
+  float roll;
+  float pitch;
+
+  double latitude;
+  double longitude;
+  float altitude;
+  float speed;
+  uint32_t satellites;
+  uint8_t gpsFix;
+
+  // BMP280 telemetry
+  float bmpTemperature;
+  float pressure;
+  float bmpAltitude;
+};
+
+SensorPacket data;
+uint32_t packetCount = 0;
+
+float roll = 0.0;
+float pitch = 0.0;
+unsigned long lastTime;
+
+void writeRegister(byte reg, byte value) {
+  I2C_MPU.beginTransmission(MPU_ADDR);
+  I2C_MPU.write(reg);
+  I2C_MPU.write(value);
+  I2C_MPU.endTransmission();
+}
+
+byte readRegister(byte reg) {
+  I2C_MPU.beginTransmission(MPU_ADDR);
+  I2C_MPU.write(reg);
+  I2C_MPU.endTransmission(false);
+
+  I2C_MPU.requestFrom(MPU_ADDR, (uint8_t)1);
+
+  if (I2C_MPU.available()) {
+    return I2C_MPU.read();
+  }
+
+  return 0xFF;
+}
+
+bool readMPU(int16_t &ax, int16_t &ay, int16_t &az,
+             int16_t &gx, int16_t &gy, int16_t &gz) {
+
+  I2C_MPU.beginTransmission(MPU_ADDR);
+  I2C_MPU.write(0x3B);
+
+  if (I2C_MPU.endTransmission(false) != 0) {
+    return false;
+  }
+
+  uint8_t received = I2C_MPU.requestFrom(
+    MPU_ADDR, (uint8_t)14
+  );
+
+  if (received < 14) {
+    while (I2C_MPU.available()) {
+      I2C_MPU.read();
+    }
+    return false;
+  }
+
+  ax = (int16_t)((I2C_MPU.read() << 8) | I2C_MPU.read());
+  ay = (int16_t)((I2C_MPU.read() << 8) | I2C_MPU.read());
+  az = (int16_t)((I2C_MPU.read() << 8) | I2C_MPU.read());
+
+  I2C_MPU.read();
+  I2C_MPU.read();
+
+  gx = (int16_t)((I2C_MPU.read() << 8) | I2C_MPU.read());
+  gy = (int16_t)((I2C_MPU.read() << 8) | I2C_MPU.read());
+  gz = (int16_t)((I2C_MPU.read() << 8) | I2C_MPU.read());
+
+  return true;
+}
+
+void readBMP280() {
+  if (!bmpReady) {
+    data.bmpTemperature = 0.0;
+    data.pressure = 0.0;
+    data.bmpAltitude = 0.0;
+    return;
+  }
+
+  data.bmpTemperature = bmp.readTemperature();
+  data.pressure = bmp.readPressure() / 100.0F;
+  data.bmpAltitude = bmp.readAltitude(1013.25F);
+}
+
+void onSent(const wifi_tx_info_t *tx_info,
+            esp_now_send_status_t status) {
+  Serial.println(status == ESP_NOW_SEND_SUCCESS
+    ? "Packet sent successfully"
+    : "Packet send failed");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize DHT11 on GPIO4
+  dht.begin();
+  delay(2000);
+
+  // GPS initialization
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, -1);
+
+  Serial.println();
+  Serial.println("NEO-6M GPS initialized");
+  Serial.println("Waiting for GPS data...");
+
+  // Initialize MPU6500 on GPIO21, GPIO22
+  I2C_MPU.begin(MPU_SDA, MPU_SCL);
+  I2C_MPU.setClock(100000);
+
+  Serial.println();
+  Serial.println("MPU sensor starting...");
+
+  byte who = readRegister(0x75);
+
+  Serial.print("WHO_AM_I = 0x");
+  Serial.println(who, HEX);
+
+  if (who != 0x70) {
+    Serial.println("MPU6500 not detected!");
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  writeRegister(0x6B, 0x00);
+  writeRegister(0x1C, 0x00);
+  writeRegister(0x1B, 0x00);
+
+  delay(100);
+
+  Serial.println("MPU6500 initialized!");
+
+  // Initialize BMP280 on GPIO25, GPIO26
+  I2C_BMP.begin(BMP_SDA, BMP_SCL);
+  I2C_BMP.setClock(100000);
+
+  Serial.println();
+  Serial.println("BMP280 sensor starting...");
+
+  if (bmp.begin(0x76)) {
+    bmpReady = true;
+  } else if (bmp.begin(0x77)) {
+    bmpReady = true;
+  }
+
+  if (bmpReady) {
+    bmp.setSampling(
+      Adafruit_BMP280::MODE_NORMAL,
+      Adafruit_BMP280::SAMPLING_X2,
+      Adafruit_BMP280::SAMPLING_X16,
+      Adafruit_BMP280::FILTER_X16,
+      Adafruit_BMP280::STANDBY_MS_500
+    );
+
+    Serial.println("BMP280 initialized successfully!");
+  } else {
+    Serial.println("WARNING: BMP280 not detected!");
+    Serial.println("Continuing without BMP280 readings.");
+  }
+
+  lastTime = millis();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  esp_wifi_set_channel(
+    WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE
+  );
+
+  Serial.print("Transmitter MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW initialization failed");
+    return;
+  }
+
+  esp_now_register_send_cb(onSent);
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMAC, 6);
+  peerInfo.channel = WIFI_CHANNEL;
+  peerInfo.ifidx = WIFI_IF_STA;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add receiver peer");
+    return;
+  }
+
+  Serial.println(
+    "DHT11 + MPU6500 + BMP280 + GPS + ESP-NOW transmitter ready"
+  );
+}
+
+void loop() {
+  // Read GPS data continuously
+  while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
+  }
+
+  int16_t axRaw, ayRaw, azRaw;
+  int16_t gxRaw, gyRaw, gzRaw;
+
+  if (!readMPU(axRaw, ayRaw, azRaw, gxRaw, gyRaw, gzRaw)) {
+    Serial.println("MPU sensor read failed");
+    delay(2000);
+    return;
+  }
+
+  float ax = axRaw / ACCEL_SCALE;
+  float ay = ayRaw / ACCEL_SCALE;
+  float az = azRaw / ACCEL_SCALE;
+
+  float gx = gxRaw / GYRO_SCALE;
+  float gy = gyRaw / GYRO_SCALE;
+  float gz = gzRaw / GYRO_SCALE;
+
+  float totalAcc = sqrt(ax * ax + ay * ay + az * az);
+
+  float accelRoll = atan2(ay, az) * 180.0 / PI;
+
+  float accelPitch = atan2(
+    -ax,
+    sqrt(ay * ay + az * az)
+  ) * 180.0 / PI;
+
+  unsigned long currentTime = millis();
+  float dt = (currentTime - lastTime) / 1000.0;
+  lastTime = currentTime;
+
+  roll += gx * dt;
+  pitch += gy * dt;
+
+  float alpha = 0.98;
+
+  roll = alpha * roll + (1.0 - alpha) * accelRoll;
+  pitch = alpha * pitch + (1.0 - alpha) * accelPitch;
+
+  data.packetNo = ++packetCount;
+
+  // Read actual DHT11 temperature and humidity
+  float dhtTemperature = dht.readTemperature();
+  float dhtHumidity = dht.readHumidity();
+
+  if (!isnan(dhtTemperature) && !isnan(dhtHumidity)) {
+    data.temperature = dhtTemperature;
+    data.humidity = dhtHumidity;
+  }
+
+  // MPU telemetry
+  data.ax = ax;
+  data.ay = ay;
+  data.az = az;
+  data.totalAcc = totalAcc;
+
+  data.gx = gx;
+  data.gy = gy;
+  data.gz = gz;
+
+  data.roll = roll;
+  data.pitch = pitch;
+
+  // BMP280 telemetry
+  readBMP280();
+
+  // GPS telemetry
+  data.gpsFix = gps.location.isValid() ? 1 : 0;
+  data.latitude = gps.location.isValid() ? gps.location.lat() : 0.0;
+  data.longitude = gps.location.isValid() ? gps.location.lng() : 0.0;
+  data.altitude = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+  data.speed = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
+  data.satellites = gps.satellites.isValid() ? gps.satellites.value() : 0;
+
+  // Send telemetry over ESP-NOW
+  esp_err_t result = esp_now_send(
+    receiverMAC,
+    (uint8_t *)&data,
+    sizeof(data)
+  );
+
+  // Serial output
+  Serial.print("Packet #");
+  Serial.print(data.packetNo);
+
+  Serial.print(" | Temperature: ");
+  Serial.print(data.temperature);
+  Serial.print(" C | Humidity: ");
+  Serial.print(data.humidity);
+  Serial.print(" %");
+
+  Serial.print(" | Acc X: ");
+  Serial.print(data.ax, 3);
+  Serial.print(" Y: ");
+  Serial.print(data.ay, 3);
+  Serial.print(" Z: ");
+  Serial.print(data.az, 3);
+  Serial.print(" | Total Acc: ");
+  Serial.print(data.totalAcc, 3);
+
+  Serial.print(" | Gyro X: ");
+  Serial.print(data.gx, 2);
+  Serial.print(" Y: ");
+  Serial.print(data.gy, 2);
+  Serial.print(" Z: ");
+  Serial.print(data.gz, 2);
+
+  Serial.print(" | Roll: ");
+  Serial.print(data.roll, 2);
+  Serial.print(" Pitch: ");
+  Serial.print(data.pitch, 2);
+
+  Serial.print(" | BMP Temperature: ");
+  Serial.print(data.bmpTemperature, 2);
+  Serial.print(" C | Pressure: ");
+  Serial.print(data.pressure, 2);
+  Serial.print(" hPa | BMP Altitude: ");
+  Serial.print(data.bmpAltitude, 2);
+  Serial.print(" m");
+
+  Serial.print(" | GPS Fix: ");
+  Serial.print(data.gpsFix);
+
+  if (data.gpsFix) {
+    Serial.print(" | Latitude: ");
+    Serial.print(data.latitude, 6);
+
+    Serial.print(" | Longitude: ");
+    Serial.print(data.longitude, 6);
+
+    Serial.print(" | GPS Altitude: ");
+    Serial.print(data.altitude, 2);
+    Serial.print(" m");
+
+    Serial.print(" | Speed: ");
+    Serial.print(data.speed, 2);
+    Serial.print(" km/h");
+  } else {
+    Serial.print(" | Waiting for GPS fix");
+  }
+
+  Serial.print(" | Satellites: ");
+  Serial.print(data.satellites);
+
+  Serial.print(" | Queue result: ");
+  Serial.println(result == ESP_OK ? "OK" : "ERROR");
+
+  delay(2000);
+}

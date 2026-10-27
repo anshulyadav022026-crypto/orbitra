@@ -1,0 +1,159 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <string.h>
+#include <stdint.h>
+#include <esp_wifi.h>
+
+#define WIFI_CHANNEL 1
+
+struct SensorPacket {
+  uint32_t packetNo;
+  float temperature;
+  float humidity;
+
+  float ax;
+  float ay;
+  float az;
+  float totalAcc;
+
+  float gx;
+  float gy;
+  float gz;
+
+  float roll;
+  float pitch;
+
+  double latitude;
+  double longitude;
+  float altitude;
+  float speed;
+  uint32_t satellites;
+  uint8_t gpsFix;
+
+  // BMP280 telemetry — must match TX structure
+  float bmpTemperature;
+  float pressure;
+  float bmpAltitude;
+};
+
+SensorPacket receivedData;
+
+volatile bool newPacketAvailable = false;
+volatile bool invalidPacketReceived = false;
+
+void onReceive(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  if (len != sizeof(SensorPacket)) {
+    invalidPacketReceived = true;
+    return;
+  }
+
+  memcpy(&receivedData, incomingData, sizeof(SensorPacket));
+  newPacketAvailable = true;
+}
+
+void printTelemetryJSON(const SensorPacket &d) {
+  Serial.print("{\"packetNo\":");
+  Serial.print(d.packetNo);
+
+  Serial.print(",\"temperature\":");
+  Serial.print(d.temperature, 2);
+
+  Serial.print(",\"humidity\":");
+  Serial.print(d.humidity, 2);
+
+  Serial.print(",\"ax\":");
+  Serial.print(d.ax, 3);
+
+  Serial.print(",\"ay\":");
+  Serial.print(d.ay, 3);
+
+  Serial.print(",\"az\":");
+  Serial.print(d.az, 3);
+
+  Serial.print(",\"totalAcc\":");
+  Serial.print(d.totalAcc, 3);
+
+  Serial.print(",\"gx\":");
+  Serial.print(d.gx, 2);
+
+  Serial.print(",\"gy\":");
+  Serial.print(d.gy, 2);
+
+  Serial.print(",\"gz\":");
+  Serial.print(d.gz, 2);
+
+  Serial.print(",\"roll\":");
+  Serial.print(d.roll, 2);
+
+  Serial.print(",\"pitch\":");
+  Serial.print(d.pitch, 2);
+
+  Serial.print(",\"latitude\":");
+  Serial.print(d.latitude, 6);
+
+  Serial.print(",\"longitude\":");
+  Serial.print(d.longitude, 6);
+
+  Serial.print(",\"altitude\":");
+  Serial.print(d.altitude, 2);
+
+  Serial.print(",\"speed\":");
+  Serial.print(d.speed, 2);
+
+  Serial.print(",\"satellites\":");
+  Serial.print(d.satellites);
+
+  Serial.print(",\"gpsFix\":");
+  Serial.print(d.gpsFix);
+
+  // BMP280 telemetry
+  Serial.print(",\"bmpTemperature\":");
+  Serial.print(d.bmpTemperature, 2);
+
+  Serial.print(",\"pressure\":");
+  Serial.print(d.pressure, 2);
+
+  Serial.print(",\"bmpAltitude\":");
+  Serial.print(d.bmpAltitude, 2);
+
+  Serial.println("}");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  // Set Wi-Fi channel
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) {
+    // Do not print non-JSON text to the serial bridge.
+    return;
+  }
+
+  esp_now_register_recv_cb(onReceive);
+}
+
+void loop() {
+  if (newPacketAvailable) {
+    noInterrupts();
+    SensorPacket packetCopy;
+    memcpy(&packetCopy, &receivedData, sizeof(SensorPacket));
+    newPacketAvailable = false;
+    interrupts();
+
+    printTelemetryJSON(packetCopy);
+  }
+
+  if (invalidPacketReceived) {
+    noInterrupts();
+    invalidPacketReceived = false;
+    interrupts();
+
+    Serial.println("{\"error\":\"Invalid packet size\"}");
+  }
+
+  delay(1);
+}
